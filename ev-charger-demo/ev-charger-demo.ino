@@ -10,9 +10,9 @@
 
 // Pins
 #define STATUS_LED_PIN 13
-#define CHARGER_CAR_DETECT_PIN 10
-#define BOLLARD_LED_PIN 6
-#define CHARGING_LED PIN 7
+#define CHARGER_CAR_DETECT_PIN 2
+#define BOLLARD_LED_PIN 7
+#define CHARGING_LED_PIN 6
 
 // FreeRTOS Params and Configuration
 #define STATE_QUEUE_SIZE 5
@@ -29,10 +29,11 @@
 #define PIXEL_FULL_BLUE 0x000000FF
 
 // Charging Stuff
-#define MAX_CHARGING 400
+#define MAX_CHARGING 80 // The total "wakes" of inprogress for 50ms over 4 seconds
+#define CHARGE_UPDATE_INTVERVAL (MAX_CHARGING / CHARGING_LED_PIXELS) // When to update a pixel
 
 // Charge State
-enum class eChargerState {
+enum class eChargerState : int {
   Null,
   VehicleVacant,
   VehicleDetected,
@@ -46,7 +47,14 @@ static TaskHandle_t xChargerTask;
 static QueueHandle_t xStateQueue;
 
 // NeoPixel Handles
-Adafruit_NeoPixel xBollardLED, xChargingLED;
+// NOTE: For some reason I can init (configure) the instance in setup or they clone each other...
+//   NEO_KHZ800  800 KHz bitstream (most NeoPixel products w/WS2812 LEDs)
+//   NEO_KHZ400  400 KHz (classic 'v1' (not v2) FLORA pixels, WS2811 drivers)
+//   NEO_GRB     Pixels are wired for GRB bitstream (most NeoPixel products)
+//   NEO_RGB     Pixels are wired for RGB bitstream (v1 FLORA pixels, not v2)
+//   NEO_RGBW    Pixels are wired for RGBW bitstream (NeoPixel RGBW products)
+Adafruit_NeoPixel xBollardLED(BOLLARD_LED_PIXELS, BOLLARD_LED_PIN, NEO_GRBW + NEO_KHZ800);
+Adafruit_NeoPixel xChargingLED(CHARGING_LED_PIXELS, CHARGING_LED_PIN, NEO_GRBW + NEO_KHZ800);
 
 // Function Prototypes
 void prvStatusCallback(TimerHandle_t xTimer);
@@ -55,15 +63,26 @@ void prvChargingTask(void* pvParameters);
 void prvUpdatePixel(uint16_t  pixelNum, Adafruit_NeoPixel& pixelHandle, uint8_t r, uint8_t g, uint8_t b, uint8_t w);
 
 void setup() {
+  // These lines are specifically to support the Adafruit Trinket 5V 16 MHz.
+  // Any other board, you can remove this part (but no harm leaving it):
+#if defined(__AVR_ATtiny85__) && (F_CPU == 16000000)
+  clock_prescale_set(clock_div_1);
+#endif
+  //  Serial.begin(9600);
+  // END of Trinket-specific code.
+  
   // Set pin mode
   pinMode(STATUS_LED_PIN, OUTPUT);
   pinMode(CHARGER_CAR_DETECT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(CHARGER_CAR_DETECT_PIN), prvCarDetectISR, CHANGE);
-  // Set the NeoPixles
-  xBollardLED = Adafruit_NeoPixel(BOLLARD_LED_PIXELS, BOLLARD_LED_PIN, NEO_GRB + NEO_KHZ800);
-  xChargingLED = Adafruit_NeoPixel(CHARGING_LED_PIXELS, CHARGING_LED_PIXELS, NEO_GRB + NEO_KHZ800);
+  
+  // Start Pixels
+  xBollardLED.begin();
+  xChargingLED.begin();
+  
   // Setup the queue
   xStateQueue = xQueueCreate(STATE_QUEUE_SIZE, sizeof(eChargerState));
+  
   // Status Timer
   xStatusTimer = xTimerCreate(
                    "Status",
@@ -71,6 +90,7 @@ void setup() {
                    pdTRUE,
                    0,
                    prvStatusCallback);
+                   
   // Charging Task
   xChargerTask = xTaskCreate(
                    prvChargingTask,
@@ -79,13 +99,11 @@ void setup() {
                    NULL,
                    1,
                    NULL);
+                   
   // Start scheduler
   // I should probably check if populated/started correctly
   xTimerStart(xStatusTimer, 0);
   vTaskStartScheduler();
-  // Start Pixels
-  xBollardLED.begin();
-  xChargingLED.begin();
 }
 
 void loop() {
@@ -99,27 +117,30 @@ static void prvStatusCallback(TimerHandle_t xTimer) {
   digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
 }
 
+
 // Detects if a car is detected
 static void prvCarDetectISR() {
   BaseType_t xHigherPriorityTaskWoken;
   eChargerState transition;
-  // Check if high or low
-  digitalRead(STATUS_LED_PIN) ? transition = eChargerState::VehicleDetected : eChargerState::VehicleVacant;
+  // Check if high or low and enqueue it
+  digitalRead(CHARGER_CAR_DETECT_PIN) ? transition = eChargerState::VehicleDetected : transition = eChargerState::VehicleVacant;
   xQueueSendFromISR(xStateQueue, &transition, xHigherPriorityTaskWoken);
 }
 
 // Manages the charging task
 static void prvChargingTask(void* pvParameters) {
   (void) pvParameters;
+  
   // Variables
   uint16_t count = 0;
-  eChargerState state = eChargerState::Null;
-  // Clear Pixels
-  xBollardLED.clear();
-  xChargingLED.clear();
-  // Set Bollard White
+  eChargerState state = eChargerState::VehicleVacant;
+  
+  // Clear LEDs
   xBollardLED.fill(PIXEL_FULL_WHITE, 0, 0);
+  xChargingLED.clear();
   xBollardLED.show();
+  xChargingLED.show();
+  
   // Run
   for (;;) {
     // Check state queue
@@ -128,6 +149,7 @@ static void prvChargingTask(void* pvParameters) {
       // We got new transition, do something...
       state = transition;
     }
+    
     // Execute based on state
     switch (state) {
       case eChargerState::VehicleVacant:
@@ -142,22 +164,29 @@ static void prvChargingTask(void* pvParameters) {
         break;
       case eChargerState::ChargeinProgress:
         // Increment and update
-        prvUpdatePixel(++count / 100, xChargingLED, 0, 255, 0, 0);
+        prvUpdatePixel(++count / CHARGE_UPDATE_INTVERVAL, xChargingLED, 0, 255, 0, 0);
         // Check if at full charge
-        if (count >= 400) {
+        if (count >= MAX_CHARGING) {
           // Complete
           state = eChargerState::ChargeComplete;
+          // xChargingLED.clear();
         }
         break;
       case eChargerState::ChargeComplete:
         // Set all green
-        xBollardLED.fill(PIXEL_FULL_GREEN, 0, 0);
-        xBollardLED.show();
+        xChargingLED.fill(PIXEL_FULL_GREEN, 0, 0);
         break;
       default:
-        // TODO
+        // Should never reach
+        xChargingLED.fill(PIXEL_FULL_RED, 0, 0);
+        // xChargingLED.getPixelColor(0) > 0 ? xChargingLED.fill(0, 0, 0) : xChargingLED.fill(PIXEL_FULL_RED, 0, 0);
         break;
     }
+    
+    // Show
+    xBollardLED.show();
+    xChargingLED.show();
+    
     // Delay
     vTaskDelay(CHARGER_TASK_DELAY);
   }
