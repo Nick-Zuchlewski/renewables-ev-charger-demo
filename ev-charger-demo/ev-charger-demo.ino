@@ -31,6 +31,8 @@
 
 // Charging Stuff
 #define MAX_CHARGING 320 // The total "wakes" of inprogress for 50ms over 4 seconds
+#define PRE_CHARGE_UPDATE_INTVERVAL 5 // How often to flag in pre-charge (Car detected)
+#define PRE_CHARGE_FULL_TIME ((PRE_CHARGE_UPDATE_INTVERVAL * 2) * 5) // The number of times it should flash in pre-charge
 #define CHARGE_UPDATE_INTVERVAL (MAX_CHARGING / CHARGING_LED_PIXELS) // When to update a pixel
 
 // Charge State
@@ -176,22 +178,33 @@ static void prvChargingTask(void* pvParameters) {
     switch (state) {
       case eChargerState::VehicleVacant:
         // Clear and wait for a vehicle
-        xTimerStop(xChargerIndicatorTimer, 0);
-        xChargingLED.clear();
-        break;
-      case eChargerState::VehicleDetected:
-        // Clear and transistio to in progress
-        xChargingLED.clear();
         pixelNum = 0;
         count = 0;
-        xQueueSend(xChargerIndicatorQueue, &pixelNum, DEFAULT_QUEUE_NO_WAIT);
-        xTimerStart(xChargerIndicatorTimer, 0);
-        state = eChargerState::ChargeinProgress;
+        xTimerStop(xChargerIndicatorTimer, 0);
+        xChargingLED.fill(PIXEL_FULL_WHITE, 0, 0);
+        break;
+      case eChargerState::VehicleDetected:
+        // Flash blue a few times
+        if ((++count / PRE_CHARGE_UPDATE_INTVERVAL) % 2 == 0) {
+          xChargingLED.fill(PIXEL_FULL_BLUE, 0, 0);
+        } else {
+          xChargingLED.clear();
+        }
+        // Check if ready to transition
+        if (count == PRE_CHARGE_FULL_TIME) {
+          // Clear and transistion to in progress
+          pixelNum = 0;
+          count = 0;
+          xQueueSend(xChargerIndicatorQueue, &pixelNum, DEFAULT_QUEUE_NO_WAIT);
+          xTimerStart(xChargerIndicatorTimer, 0);
+          xChargingLED.clear();
+          state = eChargerState::ChargeinProgress;
+        }
         break;
       case eChargerState::ChargeinProgress:
         // Increment and update
         Serial.println(pixelNum);
-        pixelNum = (++count / CHARGE_UPDATE_INTVERVAL)+1;
+        pixelNum = (++count / CHARGE_UPDATE_INTVERVAL) + 1;
         xQueueSend(xChargerIndicatorQueue, &pixelNum, DEFAULT_QUEUE_NO_WAIT);
         // Check if at full charge
         if (count >= MAX_CHARGING) {
